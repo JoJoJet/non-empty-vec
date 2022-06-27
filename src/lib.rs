@@ -1,5 +1,6 @@
 use std::convert::TryFrom;
 use std::iter::FusedIterator;
+use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::ops::{self, RangeBounds};
 use std::slice::{Iter, IterMut, SliceIndex};
@@ -348,13 +349,22 @@ pub struct DrainFilter<'a, T, F>
 where
     F: FnMut(&mut T) -> bool,
 {
-    vec: &'a mut NonEmpty<T>,
+    _p: PhantomData<&'a mut NonEmpty<T>>,
+    items: *mut T,
     f: F,
 
-    // Always `0 <= left <= right <= vec.len()`, usually `left < right`.
-    // When `left == right`, the iterator is complete.
+    // Always `0 <= left <= i < r <= right <= old_len`
+
+    // any items to the left of `left` are initialized and staying in the vector.
     left: usize,
+    // any items between `left` and `i` are uninitialized memory.
+    i: usize,
+    // any items between `i` and `r` are initialized and not searched yet.
+    r: usize,
+    // any items between `r` and `right` and uninitialized memory.
     right: usize,
+    // any items to the right of `right` are initialized and staying in the vector.
+    old_len: usize,
 }
 impl<'a, T, F> DrainFilter<'a, T, F>
 where
@@ -363,12 +373,108 @@ where
     #[inline]
     pub fn new(vec: &'a mut NonEmpty<T>, f: F) -> Self {
         let left = 0;
-        let right = vec.len().get();
+        let i = 0;
+        let old_len = vec.0.len();
+        let right = old_len;
+        let r = right;
         Self {
-            vec,
+            _p: PhantomData,
+            items: vec.0.as_mut_ptr(),
             f,
             left,
+            i,
+            r,
             right,
+            old_len,
+        }
+    }
+
+    /// Removes the first unsearched element from the front of the vector.
+    fn pop_front(&mut self) -> Option<T> {
+        if self.r - self.i > 1 {
+            let item = unsafe {
+                // Move out the first item. This is valid since the source
+                // will be uninitialized next line.
+                let item = std::ptr::read(self.items.add(self.i));
+                // due to the invariants of this type,
+                // we have just marked the former first item as uninitialized.
+                self.i += 1;
+                item
+            };
+            Some(item)
+        } else {
+            None
+        }
+    }
+    /// Removes the first unsearched element from the back of the vector.
+    fn pop_back(&mut self) -> Option<T> {
+        if self.r - self.i > 1 {
+            let item = unsafe {
+                let item = std::ptr::read(self.items.add(self.r - 1));
+                self.r -= 1;
+                item
+            };
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    #[cfg_attr(debug_assertions, track_caller)]
+    fn insert_front(&mut self, item: T) {
+        #[cold]
+        #[cfg_attr(debug_assertions, track_caller)]
+        fn do_panic() -> ! {
+            panic!("no uninitialized space available in front!");
+        }
+
+        if self.left >= self.i {
+            do_panic();
+        }
+        unsafe {
+            std::ptr::write(self.items.add(self.left), item);
+            self.left += 1;
+        }
+    }
+    #[cfg_attr(debug_assertions, track_caller)]
+    fn insert_back(&mut self, item: T) {
+        #[cold]
+        #[cfg_attr(debug_assertions, track_caller)]
+        fn do_panic() -> ! {
+            panic!("no uninitialized space available in the back!");
+        }
+
+        if self.right <= self.r {
+            do_panic();
+        }
+        unsafe {
+            std::ptr::write(self.items.add(self.right - 1), item);
+            self.right -= 1;
+        }
+    }
+}
+impl<'a, T, F> Drop for DrainFilter<'a, T, F>
+where
+    F: FnMut(&mut T) -> bool,
+{
+    fn drop(&mut self) {
+        // Move unsearched elements to the front of the vector
+        while let Some(item) = self.pop_front() {
+            self.insert_front(item);
+        }
+        // Move items at the end to the front.
+        while self.right < self.old_len {
+            // We no longer care about updateing `i` and `r` anymore.
+
+            let item = unsafe {
+                let item = std::ptr::read(self.items.add(self.right - 1));
+                self.right += 1;
+                item
+            };
+            unsafe {
+                std::ptr::write(self.items.add(self.left), item);
+                self.left += 1;
+            }
         }
     }
 }
@@ -379,30 +485,22 @@ where
 {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
-        // Loop until either we find an element or the list is depleted.
+        // Loop until either we find an element, or run out of elements to search.
         loop {
-            // Only try draining this element if there would be more elements leftover.
-            let any_yielded = self.left > 0 || self.right < self.vec.0.len();
-            if (any_yielded || self.right - self.left > 1) && self.left < self.right {
-                // If the elment passes the predicate, remove it and yield it.
-                if (self.f)(&mut self.vec[self.left]) {
-                    let item = self.vec.0.remove(self.left);
-                    self.right -= 1;
-                    break Some(item);
-                }
-                // If it doesn't pass, leave the element and repeat the loop.
-                else {
-                    self.left += 1;
-                }
+            // Remove the first unsearched element from the iterator.
+            let mut item = self.pop_front()?;
+            // If it passed the predicate, yield it.
+            if (self.f)(&mut item) {
+                break Some(item);
             }
-            // We've reached the point where we only have one element left, so leave it.
+            // Otherwise, place it back at the beginning of the vector.
             else {
-                break None;
+                self.insert_front(item);
             }
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let max = self.right - self.left;
+        let max = self.r - self.i - 1;
         (0, Some(max))
     }
 }
@@ -413,23 +511,11 @@ where
     fn next_back(&mut self) -> Option<Self::Item> {
         // Loop until either we find an element or the list is depleted.
         loop {
-            // Only try draining this element if there would be more elements leftover.
-            let any_yielded = self.right < self.vec.0.len() || self.left > 0;
-            if (any_yielded || self.right - self.left > 1) && self.right > self.left {
-                // If the elment passes the predicate, remove it and yield it.
-                if (self.f)(&mut self.vec[self.right - 1]) {
-                    let item = self.vec.0.remove(self.right - 1);
-                    self.right -= 1;
-                    break Some(item);
-                }
-                // If it doesn't pass, leave the element and repeat the loop.
-                else {
-                    self.right -= 1;
-                }
-            }
-            // We've reached the point where we only have one element left, so leave it.
-            else {
-                break None;
+            let mut item = self.pop_back()?;
+            if (self.f)(&mut item) {
+                break Some(item);
+            } else {
+                self.insert_back(item);
             }
         }
     }
@@ -637,6 +723,7 @@ mod tests {
         assert_eq!(rem.next(), Some(1));
         assert_eq!(rem.next_back(), None);
         assert_eq!(rem.next(), None);
+        std::mem::drop(rem);
         assert_eq!(v, ne_vec![2]);
     }
 
